@@ -1,0 +1,20 @@
+region = "us-east-1"
+
+# If creating VPC in this stack:
+create_vpc = true
+
+# If using existing VPC instead:
+# create_vpc = false
+# vpc_id             = "vpc-xxxxxxxx"
+# public_subnet_ids  = ["subnet-aaaa","subnet-bbbb"]
+# private_subnet_ids = ["subnet-cccc","subnet-dddd"]
+
+min_size     = 1
+max_size     = 3
+desired_size = 1
+ami_type     = "AL2_x86_64"  # or "AL2_ARM_64" + t4g instances
+
+create_redis = false
+
+owner = "platform"
+tags  = { project = "trade-minimal" }

@@ -1,0 +1,57 @@
+{
+  "info": {
+    "name": "tiny-api-smoke",
+    "_postman_id": "abcd-efgh",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "url": "{{BASE_URL}}/health"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('200 OK', function () { pm.response.to.have.status(200); });",
+              "pm.test('json ok true', function () { var j=pm.response.json(); pm.expect(j.ok).to.be.true; });"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /trade/place",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"side\":\"UP\",\"amount\":1}"
+        },
+        "url": "{{BASE_URL}}/trade/place"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('200 OK', function(){ pm.response.to.have.status(200); });",
+              "pm.test('has id', function(){ var j=pm.response.json(); pm.expect(j).to.have.property('id'); });"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    }
+  ]
+}

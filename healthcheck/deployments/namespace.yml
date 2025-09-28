@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels: { app.kubernetes.io/part-of: tiny }
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prod
+  labels: { app.kubernetes.io/part-of: tiny }
