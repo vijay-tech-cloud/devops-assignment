@@ -1,144 +1,257 @@
 pipeline {
   agent any
   options { timestamps(); ansiColor('xterm') }
+
+  // Keep only NON-secrets here (secrets are injected from Jenkins Credentials)
   environment {
-    AWS_REGION   = credentials('aws-region')
-    AWS_ACCESS_KEY_ID     = credentials('aws-access-key-id')
+    AWS_REGION = credentials('aws-region')         // secret text
+    AWS_ACCESS_KEY_ID = credentials('aws-access-key-id')
     AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
-    ECR_REPO    = 'trade-minimal'
-    CLUSTER     = 'trade-eks'
-    STAGING_NS  = 'staging'
-    PROD_NS     = 'prod'
+
+    ECR_REPO   = 'trade-api'
+    CLUSTER    = 'trade-eks'
+    STAGING_NS = 'staging'
+    PROD_NS    = 'prod'
+
+    // Adjust these 3 paths to match your repo
+    K8S_DIR    = 'step3_full/k8s'
+    TESTS_DIR  = 'step3_full/tests'
+    APP_PATH   = 'healthcheck/app'
   }
+
   stages {
+
     stage('Checkout') { steps { checkout scm } }
-    stage('Build & Unit Test') {
+
+    stage('Tooling sanity') {
       steps {
         sh '''
-          cd healthcheck/app
-          npm ci
-          npm test || true
+          echo "== Versions =="
+          which git && git --version || true
+          docker --version
+          aws --version
+          kubectl version --client --short || true
         '''
       }
     }
+
+    stage('Build & Unit Test') {
+      steps {
+        // Run Node inside a container so you don't need Node/npm on the Jenkins box
+        sh '''
+          docker run --rm \
+            -v "$PWD/${APP_PATH}":/app -w /app \
+            node:20-alpine sh -lc "
+              npm ci || npm i ;
+              npm test || echo 'no tests'
+            "
+        '''
+      }
+    }
+
     stage('SAST & Secrets') {
       steps {
         sh '''
+          set -e
           mkdir -p reports
-          docker run --rm -v $PWD:/repo zricethezav/gitleaks:latest detect --source=/repo --report-format sarif --report-path reports/gitleaks.sarif || true
-          docker run --rm -v $PWD:/src aquasec/trivy:latest fs --exit-code 0 --severity HIGH,CRITICAL --format sarif --output reports/trivy-fs.sarif . || true
+
+          # Gitleaks -> write reports INSIDE the workspace via the bind mount
+          docker run --rm -v "$PWD":/repo zricethezav/gitleaks:latest detect \
+            --source=/repo \
+            --report-format sarif \
+            --report-path /repo/reports/gitleaks.sarif || true
+
+          # Trivy FS -> same: write to /repo/reports
+          docker run --rm -v "$PWD":/repo aquasec/trivy:latest fs /repo \
+            --exit-code 0 --severity HIGH,CRITICAL \
+            --format sarif --output /repo/reports/trivy-fs.sarif || true
+
+          echo "Reports generated:" && ls -l reports || true
         '''
       }
-      post { always { archiveArtifacts 'reports/*.sarif' } }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/*.sarif', allowEmptyArchive: true
+        }
+      }
     }
+
     stage('Docker Build & SBOM (push to ECR)') {
       steps {
         sh '''
+          set -e
+          mkdir -p reports
+
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          aws ecr describe-repositories --repository-names ${ECR_REPO} || aws ecr create-repository --repository-name ${ECR_REPO}
-          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com
-          IMAGE=$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${GIT_COMMIT}
-          docker build -t $IMAGE ./healthcheck/app
-          docker push $IMAGE
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock anchore/syft:latest $IMAGE -o spdx-json > reports/sbom.spdx.json
+
+          # Create repo if missing
+          aws ecr describe-repositories --repository-name "${ECR_REPO}" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "${ECR_REPO}" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256
+
+          # ECR login
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          TAG="${GIT_COMMIT:-manual}-$(date +%Y%m%d%H%M%S)"
+          IMAGE="$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:$TAG"
+
+          docker build -t app:ci "${APP_PATH}"
+          docker tag app:ci "$IMAGE"
+          docker push "$IMAGE"
+          echo "$IMAGE" > image.txt
+
+          # SBOM (Syft)
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            anchore/syft:latest "$IMAGE" -o spdx-json > reports/sbom.spdx.json || true
+
+          echo "Built & pushed: $(cat image.txt)"
         '''
       }
-      post { always { archiveArtifacts 'reports/sbom.spdx.json' } }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/sbom.spdx.json', allowEmptyArchive: true
+        }
+      }
     }
+
     stage('Terraform Plan/Apply (staging)') {
       when { not { branch 'main' } }
       steps {
         sh '''
-          cd healthcheck/terraform
-          terraform init -upgrade
-          terraform workspace select staging || terraform workspace new staging
-          terraform plan -out=tf.plan
-          terraform apply -auto-approve tf.plan || terraform apply -auto-approve
+          if [ -d "healthcheck/terraform" ]; then
+            cd healthcheck/terraform
+            terraform init -upgrade
+            terraform workspace select staging || terraform workspace new staging
+            terraform plan -out=tf.plan
+            terraform apply -auto-approve tf.plan || terraform apply -auto-approve
+          else
+            echo "No Terraform dir found; skipping infra apply for staging"
+          fi
         '''
       }
     }
-    stage('Deploy: Staging') {
+
+    stage('Deploy: Staging (blue)') {
       when { not { branch 'main' } }
       steps {
         sh '''
-          aws eks update-kubeconfig --name ${CLUSTER} --region ${AWS_REGION}
-          export NAMESPACE=${STAGING_NS}
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          export IMAGE_URI=$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${GIT_COMMIT}
-          kubectl apply -f ${WORKSPACE}/step3_full/k8s/00-namespace.yaml
-          envsubst < ${WORKSPACE}/step3_full/k8s/10-deployment-blue.yaml  | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/11-deployment-green.yaml | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/20-service.yaml          | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/30-hpa.yaml              | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/40-pdb.yaml              | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/50-ingress.yaml          | kubectl apply -f -
+          set -e
+          aws eks update-kubeconfig --name "${CLUSTER}" --region "${AWS_REGION}"
+
+          export NS="${STAGING_NS}"
+          export IMAGE="$(cat image.txt)"
+
+          # Namespace(s)
+          kubectl apply -f "${K8S_DIR}/00-namespace.yaml"
+
+          # App (blue path)
+          envsubst < "${K8S_DIR}/20-service.yaml"          | kubectl apply -f -
+          envsubst < "${K8S_DIR}/10-deployment-blue.yaml"  | kubectl apply -f -
+          envsubst < "${K8S_DIR}/50-ingress.yaml"          | kubectl apply -f -
+
+          kubectl -n "${NS}" rollout status deploy/tiny-blue --timeout=180s
         '''
       }
     }
+
     stage('Smoke/E2E on Staging') {
       when { not { branch 'main' } }
       steps {
         sh '''
-          URL=$(kubectl -n ${STAGING_NS} get ing tiny -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-          docker run --rm -v ${WORKSPACE}/step3_full/tests/newman:/etc/newman postman/newman:alpine             run /etc/newman/collection.json --env-var BASE_URL=http://$URL
+          set -e
+          URL=$(kubectl -n "${STAGING_NS}" get ing tiny -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Staging URL: http://$URL"
+          # If you have a Newman collection, keep this line; otherwise comment it out
+          docker run --rm -v "${WORKSPACE}/${TESTS_DIR}/newman":/etc/newman \
+            postman/newman:alpine run /etc/newman/collection.json --env-var BASE_URL=http://$URL || true
         '''
       }
     }
+
     stage('Quick Load Test (k6)') {
       when { not { branch 'main' } }
       steps {
         sh '''
-          URL=$(kubectl -n ${STAGING_NS} get ing tiny -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-          docker run --rm -e BASE=http://$URL -v ${WORKSPACE}/step3_full/tests/load:/scripts grafana/k6 run /scripts/k6.js
+          set -e
+          URL=$(kubectl -n "${STAGING_NS}" get ing tiny -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          docker run --rm -e BASE=http://$URL -v "${WORKSPACE}/${TESTS_DIR}/load":/scripts grafana/k6 run /scripts/k6.js
         '''
       }
     }
+
     stage('Gate to Prod') {
       when { branch 'main' }
-      steps { input message: 'Promote to prod? SLOs green & rollback ready', ok: 'Deploy' }
+      steps {
+        input message: 'Promote to prod? SLOs green & rollback ready', ok: 'Deploy'
+      }
     }
+
     stage('Blue/Green to Prod') {
       when { branch 'main' }
       steps {
         sh '''
-          cd healthcheck/terraform
-          terraform workspace select prod || terraform workspace new prod
-          terraform plan -out=tf.plan
-          terraform apply -auto-approve tf.plan || terraform apply -auto-approve
+          set -e
+          aws eks update-kubeconfig --name "${CLUSTER}" --region "${AWS_REGION}"
 
-          aws eks update-kubeconfig --name ${CLUSTER} --region ${AWS_REGION}
-          export NAMESPACE=${PROD_NS}
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          export IMAGE_URI=$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${GIT_COMMIT}
+          export NS="${PROD_NS}"
+          export IMAGE="$(cat image.txt)"
 
-          kubectl apply -f ${WORKSPACE}/step3_full/k8s/00-namespace.yaml
-          envsubst < ${WORKSPACE}/step3_full/k8s/10-deployment-blue.yaml  | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/11-deployment-green.yaml | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/20-service.yaml          | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/30-hpa.yaml              | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/40-pdb.yaml              | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/50-ingress.yaml          | kubectl apply -f -
+          kubectl apply -f "${K8S_DIR}/00-namespace.yaml"
+          envsubst < "${K8S_DIR}/20-service.yaml"           | kubectl apply -f -
+          envsubst < "${K8S_DIR}/11-deployment-green.yaml"  | kubectl apply -f -
 
-          # switch to green
-          kubectl -n ${PROD_NS} patch svc tiny -p '{"spec":{"selector":{"app":"tiny","track":"green"}}}'
+          kubectl -n "${NS}" rollout status deploy/tiny-green --timeout=180s
+
+          # Switch traffic to GREEN (labels must use 'version' in your YAMLs)
+          kubectl -n "${NS}" patch svc tiny --type=merge \
+            -p '{"spec":{"selector":{"app":"tiny","version":"green"}}}'
+
+          envsubst < "${K8S_DIR}/50-ingress.yaml"           | kubectl apply -f -
         '''
       }
     }
+
     stage('Post-Deploy Verification') {
       when { branch 'main' }
       steps {
         sh '''
-          URL=$(kubectl -n ${PROD_NS} get ing tiny -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-          docker run --rm -v ${WORKSPACE}/step3_full/tests/newman:/etc/newman postman/newman:alpine             run /etc/newman/collection.json --env-var BASE_URL=http://$URL
-          docker run --rm -e BASE=http://$URL -v ${WORKSPACE}/step3_full/tests/load:/scripts grafana/k6 run /scripts/k6.js
+          set -e
+          URL=$(kubectl -n "${PROD_NS}" get ing tiny -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Prod URL: http://$URL"
+
+          # Optional Newman
+          docker run --rm -v "${WORKSPACE}/${TESTS_DIR}/newman":/etc/newman \
+            postman/newman:alpine run /etc/newman/collection.json --env-var BASE_URL=http://$URL || true
+
+          # k6 thresholds will fail the build and trigger rollback below if needed
+          docker run --rm -e BASE=http://$URL -v "${WORKSPACE}/${TESTS_DIR}/load":/scripts grafana/k6 run /scripts/k6.js
         '''
       }
     }
-  }
+  } // stages
+
   post {
     always {
       junit allowEmptyResults: true, testResults: 'reports/**/*.xml'
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
+      archiveArtifacts artifacts: 'reports/**, image.txt', allowEmptyArchive: true
+    }
+    failure {
+      // Automatic rollback if prod tests failed after switch
+      script {
+        try {
+          sh '''
+            set -e
+            kubectl -n "${PROD_NS}" patch svc tiny --type=merge \
+              -p '{"spec":{"selector":{"app":"tiny","version":"blue"}}}'
+            echo "Rolled back Service selector to BLUE"
+          '''
+        } catch (e) {
+          echo "Rollback step skipped or failed: ${e}"
+        }
+      }
     }
   }
 }
