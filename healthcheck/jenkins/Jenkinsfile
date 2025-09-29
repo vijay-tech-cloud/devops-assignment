@@ -21,16 +21,39 @@ pipeline {
         '''
       }
     }
-    stage('SAST & Secrets') {
-      steps {
-        sh '''
-          mkdir -p reports
-          docker run --rm -v $PWD:/repo zricethezav/gitleaks:latest detect --source=/repo --report-format sarif --report-path reports/gitleaks.sarif || true
-          docker run --rm -v $PWD:/src aquasec/trivy:latest fs --exit-code 0 --severity HIGH,CRITICAL --format sarif --output reports/trivy-fs.sarif . || true
-        '''
-      }
-      post { always { archiveArtifacts 'reports/*.sarif' } }
+  stage('SAST & Secrets') {
+    steps {
+      sh '''
+        set -e
+        mkdir -p reports
+
+        # Gitleaks -> write into mounted /out (maps to $PWD/reports)
+        docker run --rm \
+          -v "$PWD":/repo \
+          -v "$PWD/reports":/out \
+          zricethezav/gitleaks:latest detect \
+            --source=/repo \
+            --report-format sarif \
+            --report-path /out/gitleaks.sarif || true
+
+        # Trivy FS -> same, write to /out (safe absolute path)
+        docker run --rm \
+          -v "$PWD":/repo \
+          -v "$PWD/reports":/out \
+          aquasec/trivy:latest fs /repo \
+            --exit-code 0 --severity HIGH,CRITICAL \
+            --format sarif --output /out/trivy-fs.sarif || true
+
+        echo "Reports present:" && ls -l reports || true
+      '''
     }
+    post {
+      always {
+        archiveArtifacts artifacts: 'reports/*.sarif', allowEmptyArchive: true
+      }
+    }
+}
+
     stage('Docker Build & SBOM (push to ECR)') {
       steps {
         sh '''
@@ -65,13 +88,13 @@ pipeline {
           export NAMESPACE=${STAGING_NS}
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           export IMAGE_URI=$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${GIT_COMMIT}
-          kubectl apply -f ${WORKSPACE}/step3_full/k8s/00-namespace.yaml
-          envsubst < ${WORKSPACE}/step3_full/k8s/10-deployment-blue.yaml  | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/11-deployment-green.yaml | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/20-service.yaml          | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/30-hpa.yaml              | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/40-pdb.yaml              | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/50-ingress.yaml          | kubectl apply -f -
+          kubectl apply -f ${WORKSPACE}/deployments/namespace.yml
+          envsubst < ${WORKSPACE}/deployments/blue-deployment.yml  | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/green-deployment.yml | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/service.yml          | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/hpa.yml              | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/pdb.yml              | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/ingress.yml          | kubectl apply -f -
         '''
       }
     }
@@ -111,13 +134,13 @@ pipeline {
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           export IMAGE_URI=$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${GIT_COMMIT}
 
-          kubectl apply -f ${WORKSPACE}/step3_full/k8s/00-namespace.yaml
-          envsubst < ${WORKSPACE}/step3_full/k8s/10-deployment-blue.yaml  | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/11-deployment-green.yaml | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/20-service.yaml          | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/30-hpa.yaml              | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/40-pdb.yaml              | kubectl apply -f -
-          envsubst < ${WORKSPACE}/step3_full/k8s/50-ingress.yaml          | kubectl apply -f -
+          kubectl apply -f ${WORKSPACE}/deployments/namespace.yml
+          envsubst < ${WORKSPACE}/deployments/blue-deployment.yml  | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/green-deployment.yml | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/service.yml          | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/hpa.yml              | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/pdb.yml              | kubectl apply -f -
+          envsubst < ${WORKSPACE}/deployments/ingress.yml          | kubectl apply -f -
 
           # switch to green
           kubectl -n ${PROD_NS} patch svc tiny -p '{"spec":{"selector":{"app":"tiny","track":"green"}}}'
